@@ -1,0 +1,13 @@
+<resources>
+    <string name="app_name">MultiSet SDK</string>
+
+    <string name="info_text">To get ClientId and ClientSecret visit:\n<b><u> https://developer.multiset.ai/credentials</u></b></string>
+
+    <string name="tracking_initializing">Tracking Initializing...</string>
+    <string name="ready_to_localize">Ready to localize</string>
+    <string name="reset">Reset</string>
+    <string name="localize">Localize</string>
+    <string name="multiset_vps_demo">MultiSet VPS Demo</string>
+    <string name="ready_to_authenticate">Ready to authenticate</string>
+    <string name="auth">Auth</string>
+</resources>
