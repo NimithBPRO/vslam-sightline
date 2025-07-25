@@ -38,16 +38,6 @@ class Util {
             )
         }
 
-        fun negateMatrixColumns(matrix: Array<FloatArray>): Array<FloatArray> {
-            val result = Array(4) { i -> matrix[i].clone() }
-            // Negate columns 1 and 2 (indices 1 and 2)
-            for (i in 0..3) {
-                result[i][1] *= -1f // Column 1
-                result[i][2] *= -1f // Column 2
-            }
-            return result
-        }
-
         fun createTransformMatrix(
             rotationMatrix: Array<FloatArray>,
             position: Vector3

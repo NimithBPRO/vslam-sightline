@@ -35,7 +35,6 @@ import com.multiset.sdk.android.utils.Util.Companion.extractPosition
 import com.multiset.sdk.android.utils.Util.Companion.extractRotation
 import com.multiset.sdk.android.utils.Util.Companion.invertMatrix
 import com.multiset.sdk.android.utils.Util.Companion.multiplyMatrices
-import com.multiset.sdk.android.utils.Util.Companion.negateMatrixColumns
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -401,11 +400,8 @@ class ARActivity : AppCompatActivity() {
         // Create rotation matrix from quaternion
         val rotationMatrix = createMatrixFromQuaternion(resRotation)
 
-        // Negate specific matrix elements (columns 1 and 2)
-        val negatedRotationMatrix = negateMatrixColumns(rotationMatrix)
-
         // Create negated response matrix (translation included)
-        val negatedResponseMatrix = createTransformMatrix(negatedRotationMatrix, resPosition)
+        val negatedResponseMatrix = createTransformMatrix(rotationMatrix, resPosition)
 
         // Invert the negated response matrix
         val invNegatedResponseMatrix = invertMatrix(negatedResponseMatrix)
@@ -423,11 +419,7 @@ class ARActivity : AppCompatActivity() {
         val resultPosition = extractPosition(resultantMatrix)
         val resultRotationRaw = extractRotation(resultantMatrix)
 
-        // Always apply -90° Y correction
-        val yCorrection = Quaternion(Vector3.up(), -90f)
-        val correctedRotation = Quaternion.multiply(yCorrection, resultRotationRaw)
-
-        return ResultPose(resultPosition, correctedRotation)
+        return ResultPose(resultPosition, resultRotationRaw)
     }
 
 
