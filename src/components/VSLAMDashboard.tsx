@@ -16,6 +16,7 @@ interface ScanState {
 }
 
 export function VSLAMDashboard() {
+  console.log("VSLAMDashboard component rendering...");
   const [selectedCamera, setSelectedCamera] = useState<string>("");
   const [arCoreEnabled, setArCoreEnabled] = useState(false);
   const [showARModal, setShowARModal] = useState(false);
