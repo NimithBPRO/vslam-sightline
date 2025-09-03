@@ -1,0 +1,12 @@
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">192.168.4.1</domain>
+        <domain includeSubdomains="true">172.20.10.2</domain>
+        <domain includeSubdomains="true">172.20.10.4</domain>
+        <domain includeSubdomains="true">192.168.88.38</domain>
+
+
+        <!-- Add other ESP32 IPs if needed -->
+    </domain-config>
+</network-security-config>
+

@@ -1,17 +1,18 @@
 /*
 Copyright (c) 2025 MultiSet AI. All rights reserved.
-Licensed under the MultiSet License. You may not use this file except in compliance with the License. and you can’t re-distribute this file without a prior notice
+Licensed under the MultiSet License. You may not use this file except in compliance with the License.
+You may not re-distribute this file without prior notice.
 For license details, visit www.multiset.ai.
-Redistribution in source or binary forms must retain this notice.
 */
 package com.multiset.sdk.android.ar
 
 import android.annotation.SuppressLint
-import android.content.res.Configuration
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.os.Bundle
 import android.util.Log
 import android.view.View
+import android.webkit.WebView
 import android.widget.Toast
 import androidx.activity.viewModels
 import androidx.appcompat.app.AppCompatActivity
@@ -29,18 +30,12 @@ import com.multiset.sdk.android.config.SDKConfig
 import com.multiset.sdk.android.databinding.ActivityArBinding
 import com.multiset.sdk.android.network.LocalizationResponse
 import com.multiset.sdk.android.network.NetworkManager
-import com.multiset.sdk.android.utils.Util.Companion.createMatrixFromQuaternion
-import com.multiset.sdk.android.utils.Util.Companion.createTransformMatrix
-import com.multiset.sdk.android.utils.Util.Companion.extractPosition
-import com.multiset.sdk.android.utils.Util.Companion.extractRotation
-import com.multiset.sdk.android.utils.Util.Companion.invertMatrix
-import com.multiset.sdk.android.utils.Util.Companion.multiplyMatrices
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
-import java.io.File
-import java.io.FileOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
 
 class ARActivity : AppCompatActivity() {
 
@@ -50,7 +45,7 @@ class ARActivity : AppCompatActivity() {
     private var authToken: String? = null
     private var gizmoNode: GizmoNode? = null
     private var isLocalizing = false
-
+    private var esp32StreamUrl: String? = null
     private val networkManager by lazy { NetworkManager() }
     private val imageProcessor by lazy { ImageProcessor() }
 
@@ -60,188 +55,169 @@ class ARActivity : AppCompatActivity() {
         setContentView(binding.root)
 
         authToken = intent.getStringExtra("AUTH_TOKEN")
+        esp32StreamUrl = intent.getStringExtra("ESP32_STREAM_URL")
 
-        if (authToken == null) {
-            showToast("Auth token is required")
+        if (authToken == null || esp32StreamUrl.isNullOrEmpty()) {
+            showToast("Auth token and ESP32 stream URL required")
             finish()
             return
         }
 
+        // Initialize AR & observers
         setupAR()
-        setupUI()
         observeViewModel()
-
-        // Update gizmo position at origin
         updateGizmoPosition(Vector3.zero(), Quaternion.identity())
 
+        // Setup ESP32 streaming UI and localization flow
+        setupESP32Mode()
     }
 
+    /** ---------------- ARCore Setup ---------------- **/
     private fun setupAR() {
         val fragment = supportFragmentManager.findFragmentById(binding.arFragment.id)
         if (fragment is ArFragment) {
             arFragment = fragment
-            // Wait until the fragment's view is created
+
+            // When fragment's view lifecycle owner is ready, attach update listener
             arFragment.viewLifecycleOwnerLiveData.observe(this) { owner ->
                 if (owner != null && arFragment.arSceneView != null) {
                     arFragment.arSceneView.scene.addOnUpdateListener { frameTime ->
                         onSceneUpdate(frameTime)
                     }
+                    // When session is created, configure and add the gizmo
                     arFragment.setOnSessionInitializationListener { session ->
                         configureSession(session)
                         addGizmoToScene()
                     }
                 }
             }
+        } else {
+            Log.e("ARActivity", "AR fragment not found or wrong ID in layout")
         }
     }
-
 
     private fun configureSession(session: Session) {
         val config = Config(session).apply {
             updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
             focusMode = Config.FocusMode.AUTO
             lightEstimationMode = Config.LightEstimationMode.AMBIENT_INTENSITY
-
             depthMode = Config.DepthMode.AUTOMATIC
         }
         session.configure(config)
     }
 
-    private fun setupUI() {
+    /** ---------------- ESP32 Streaming + Localization ---------------- **/
+    private fun setupESP32Mode() {
+        binding.esp32WebView.settings.javaScriptEnabled = true
+        binding.esp32WebView.settings.useWideViewPort = true
+        binding.esp32WebView.settings.loadWithOverviewMode = true
+        binding.esp32WebView.settings.cacheMode = android.webkit.WebSettings.LOAD_NO_CACHE
+
+        startStream()
+
         binding.localizeButton.setOnClickListener {
             if (!isLocalizing) {
-                startLocalization()
-            }
-        }
+                isLocalizing = true
+                binding.progressBar.visibility = View.VISIBLE
+                binding.localizationStatus.text = "Capturing image..."
 
-        binding.resetButton.setOnClickListener {
-            resetWorldOrigin()
-        }
+                lifecycleScope.launch {
+                    try {
+                        // stop live stream rendering in WebView
+                        stopStream()
 
-        binding.closeButton.setOnClickListener {
-            finish()
-        }
-    }
+                        // fetch single snapshot from ESP32 /capture
+                        val bitmap = fetchEsp32FrameBitmapFromCapture(esp32StreamUrl!!)
+                        if (bitmap != null) {
+                            // display the captured image in the webview while processing
+                            showImageInWebView(bitmap)
 
-    private fun observeViewModel() {
-        viewModel.trackingState.observe(this) { state ->
-            binding.statusText.text = state
-        }
+                            // get a pose (IMU/ARCore)
+                            val pose = getCurrentCameraPoseFromIMU()
 
-        viewModel.localizationResult.observe(this) { result ->
-            result?.let {
-                handleLocalizationResult(it)
-            }
-        }
-    }
-
-    private fun onSceneUpdate(frameTime: FrameTime) {
-        val frame = arFragment.arSceneView.arFrame ?: return
-
-        if (frame.camera.trackingState != TrackingState.TRACKING) {
-            return
-        }
-
-        // Update tracking state
-        when (frame.camera.trackingState) {
-            TrackingState.TRACKING -> {
-                viewModel.updateTrackingState("Tracking Normal")
-                binding.localizeButton.isEnabled = true
-            }
-
-            TrackingState.PAUSED -> {
-                viewModel.updateTrackingState("Tracking Paused")
-                binding.localizeButton.isEnabled = false
-            }
-
-            TrackingState.STOPPED -> {
-                viewModel.updateTrackingState("Tracking Stopped")
-                binding.localizeButton.isEnabled = false
-            }
-        }
-    }
-
-    private fun startLocalization() {
-        val frame = arFragment.arSceneView.arFrame ?: return
-
-        if (frame.camera.trackingState != TrackingState.TRACKING) {
-            showToast("Camera tracking not ready")
-            return
-        }
-
-        isLocalizing = true
-        binding.progressBar.visibility = View.VISIBLE
-        binding.localizationStatus.text = "Localizing..."
-
-        lifecycleScope.launch {
-            try {
-                val cameraPose = getCurrentCameraPose(frame)
-                val bitmap = captureFrameImage(frame)
-
-                if (bitmap != null && authToken != null) {
-                    sendLocalizationRequest(bitmap, cameraPose)
-                }
-            } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    showToast("Localization error: ${e.message}")
-                    binding.progressBar.visibility = View.GONE
-                    isLocalizing = false
+                            // send to localization
+                            sendLocalizationRequest(bitmap, pose)
+                        } else {
+                            showToast("Failed to fetch image from device")
+                            resumeStream()
+                            binding.progressBar.visibility = View.GONE
+                            isLocalizing = false
+                        }
+                    } catch (e: Exception) {
+                        Log.e("ARActivity", "Localization flow failed: ${e.message}")
+                        showToast("Localization error: ${e.message ?: "unknown"}")
+                        resumeStream()
+                        binding.progressBar.visibility = View.GONE
+                        isLocalizing = false
+                    }
                 }
             }
         }
+
+        binding.resetButton.setOnClickListener { resetWorldOrigin() }
+        binding.closeButton.setOnClickListener { finish() }
     }
 
-    private fun getCurrentCameraPose(frame: Frame): CameraPose {
-        val pose = frame.camera.pose
-        val position = Vector3(pose.tx(), pose.ty(), pose.tz())
-        var rotation = Quaternion(pose.qx(), pose.qy(), pose.qz(), pose.qw())
-
-        // Apply orientation correction to match Unity ARFoundation behavior
-        // Unity ARFoundation always reports camera rotation relative to landscape orientation
-        if (!isLandscapeOrientation()) {
-            // In portrait mode, we need to remove the extra 90-degree rotation
-            // Create a quaternion for +90 degrees around Z axis (to counteract the -90)
-            val orientationCorrection = Quaternion.axisAngle(Vector3(0f, 0f, 1f), 90f)
-
-            // Apply the correction to make portrait rotation match landscape
-            rotation = Quaternion.multiply(rotation, orientationCorrection)
+    private fun startStream() {
+        esp32StreamUrl?.let {
+            binding.esp32WebView.visibility = View.VISIBLE
+            // ensure URL includes protocol (http://)
+            val finalUrl = if (it.startsWith("http")) it else "http://$it"
+            binding.esp32WebView.loadUrl(finalUrl)
         }
-
-        // Validate position magnitude
-        val positionMagnitude = position.length()
-        if (positionMagnitude < 1e-6f) {
-            Log.w(
-                "Multiset_LOG >>",
-                "Camera position is too close to origin, AR might not be initialized yet"
-            )
-        }
-
-        return CameraPose(position, rotation)
     }
 
-    private suspend fun captureFrameImage(frame: Frame): Bitmap? =
-        withContext(Dispatchers.Default) {
-            try {
-                val image = frame.acquireCameraImage()
-                val rawBitmap = imageProcessor.imageToRgbBitmap(image) // Convert Image to Bitmap
-                image.close()
+    private fun stopStream() {
+        // stop and hide webview to release HTTP connection
+        try {
+            binding.esp32WebView.stopLoading()
+        } catch (_: Exception) { }
+        binding.esp32WebView.visibility = View.INVISIBLE
+    }
 
-                // Rotate if in portrait mode
-                val finalBitmap = if (!isLandscapeOrientation()) {
-                    rotateBitmap(rawBitmap, 90f)
-                } else {
-                    rawBitmap
-                }
+    private fun resumeStream() {
+        binding.esp32WebView.visibility = View.VISIBLE
+        startStream()
+    }
 
-                finalBitmap
-            } catch (e: Exception) {
+    private fun showImageInWebView(bitmap: Bitmap) {
+        lifecycleScope.launch(Dispatchers.Main) {
+            val stream = ByteArrayOutputStream()
+            bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream)
+            val base64Image = android.util.Base64.encodeToString(stream.toByteArray(), android.util.Base64.DEFAULT)
+            val html = "<html><body style='margin:0;padding:0;background:black;'><img src='data:image/png;base64,$base64Image' " +
+                    "style='width:100%;height:100%;object-fit:contain;'/></body></html>"
+            binding.esp32WebView.loadData(html, "text/html", "utf-8")
+        }
+    }
+
+    private suspend fun fetchEsp32FrameBitmapFromCapture(streamUrl: String): Bitmap? = withContext(Dispatchers.IO) {
+        try {
+            // Build /capture URL robustly
+            val raw = if (streamUrl.endsWith("/")) streamUrl else "$streamUrl/"
+            val urlStr = if (raw.startsWith("http")) "$raw${"capture"}" else "http://$raw${"capture"}"
+            val conn = URL(urlStr).openConnection() as HttpURLConnection
+            conn.connectTimeout = 5000
+            conn.readTimeout = 5000
+            conn.requestMethod = "GET"
+            conn.doInput = true
+            conn.connect()
+
+            if (conn.responseCode == HttpURLConnection.HTTP_OK) {
+                val input = conn.inputStream
+                val bmp = BitmapFactory.decodeStream(input)
+                input.close()
+                conn.disconnect()
+                bmp
+            } else {
+                Log.w("ESP32_FETCH", "Non-200 response: ${conn.responseCode}")
+                conn.disconnect()
                 null
             }
+        } catch (e: Exception) {
+            Log.e("ESP32_FETCH", "Error fetching image: ${e.message}")
+            null
         }
-
-    private fun rotateBitmap(bitmap: Bitmap, degrees: Float): Bitmap {
-        val matrix = android.graphics.Matrix().apply { postRotate(degrees) }
-        return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
     }
 
     private suspend fun sendLocalizationRequest(bitmap: Bitmap, cameraPose: CameraPose) {
@@ -252,14 +228,12 @@ class ARActivity : AppCompatActivity() {
 
         withContext(Dispatchers.IO) {
             try {
-                // Resize and process image - NOW PASSING CONTEXT
                 val processedData = imageProcessor.processImageForLocalization(
                     bitmap,
                     arFragment.arSceneView.arFrame!!,
-                    this@ARActivity  // Pass the context here
+                    this@ARActivity
                 )
 
-                // Prepare parameters
                 val parameters = mutableMapOf(
                     "isRightHanded" to "true",
                     "fx" to processedData.fx.toString(),
@@ -270,65 +244,59 @@ class ARActivity : AppCompatActivity() {
                     "height" to processedData.height.toString()
                 )
 
-                // Add map code based on type
                 when (SDKConfig.getActiveMapType()) {
                     SDKConfig.MapType.MAP -> parameters["mapCode"] = SDKConfig.MAP_CODE
                     SDKConfig.MapType.MAP_SET -> parameters["mapSetCode"] = SDKConfig.MAP_SET_CODE
                 }
 
-                // Convert bitmap to JPEG
                 val outputStream = ByteArrayOutputStream()
                 processedData.bitmap.compress(Bitmap.CompressFormat.JPEG, 90, outputStream)
                 val imageData = outputStream.toByteArray()
 
-                // Send request
-                val response = networkManager.sendLocalizationRequest(
+                val response: LocalizationResponse = networkManager.sendLocalizationRequest(
                     authToken!!,
                     parameters,
                     imageData
                 )
 
+                // Build internal LocalizationResult and post to viewModel (or directly handle)
+                val localResult = LocalizationResult(
+                    response = response,
+                    cameraPose = cameraPose,
+                    resultPose = ResultPose(Vector3.zero(), Quaternion.identity()) // placeholder until poseHandler fills it
+                )
+
+                // Calculate processed pose on UI thread
                 withContext(Dispatchers.Main) {
-                    viewModel.setLocalizationResult(response, cameraPose)
+                    // compute and apply pose using poseHandler (same logic as Swift)
+                    val processedPose = poseHandler(response, cameraPose)
+                    // update the resultPose in localResult (we'll create a new one)
+                    val finalResult = LocalizationResult(response, cameraPose, ResultPose(processedPose.position, processedPose.rotation))
+                    viewModel.setLocalizationResult(response, cameraPose) // keep your ViewModel API call (assumed)
+                    // handle the result in UI
+                    handleLocalizationResult(finalResult)
                     binding.progressBar.visibility = View.GONE
                     isLocalizing = false
+                    resumeStream()
                 }
 
             } catch (e: Exception) {
+                Log.e("LOCALIZE", "Send localization failed: ${e.message}")
                 withContext(Dispatchers.Main) {
-                    showToast("Localization Failed!")
+                    showToast("Localization failed!")
                     binding.progressBar.visibility = View.GONE
                     isLocalizing = false
+                    resumeStream()
                 }
             }
         }
     }
 
-    @SuppressLint("DefaultLocale")
-    private fun handleLocalizationResult(result: LocalizationResult) {
-
-        if (result.response.poseFound) {
-            binding.localizationStatus.text = "Localization Success"
-
-            // Process the pose using the same logic as Swift
-            val processedPose = poseHandler(result.response, result.cameraPose)
-
-            // Update gizmo position with processed pose
-            updateGizmoPosition(processedPose.position, processedPose.rotation)
-
-            showToast("Localization successful!")
-        } else {
-            binding.localizationStatus.text = "Localization failed"
-            showToast("Pose not found")
-        }
-    }
-
+    /** ---------------- Gizmo & AR Overlay ---------------- **/
     private fun addGizmoToScene() {
         val scene = arFragment.arSceneView.scene
-        gizmoNode = GizmoNode(this) // Pass context
+        gizmoNode = GizmoNode(this)
         scene.addChild(gizmoNode)
-
-        // Show gizmo at origin initially
         gizmoNode?.show()
     }
 
@@ -336,36 +304,72 @@ class ARActivity : AppCompatActivity() {
         gizmoNode?.let { node ->
             node.localPosition = position
             node.localRotation = rotation
-            node.show() // Make sure it's visible
-        } ?: run {
-            Log.e("Multiset_LOG >>", "Gizmo node is null!")
+            node.show()
+        } ?: Log.e("Multiset_LOG >>", "Gizmo node is null!")
+    }
+
+    /** Observe ViewModel (explicit typed observer for localization result) **/
+    private fun observeViewModel() {
+        viewModel.trackingState.observe(this) { state ->
+            binding.statusText.text = state
+        }
+
+        // Explicit type so Kotlin doesn't try to infer from unknown ViewModel type
+        viewModel.localizationResult.observe(this) { result: LocalizationResult? ->
+            result?.let {
+                handleLocalizationResult(it)
+            }
+        }
+    }
+
+    @SuppressLint("DefaultLocale")
+    private fun handleLocalizationResult(result: LocalizationResult) {
+        if (result.response.poseFound) {
+            binding.localizationStatus.text = "Localization Success"
+            // Compute final pose (poseHandler) and update gizmo
+            val processedPose = poseHandler(result.response, result.cameraPose)
+            updateGizmoPosition(processedPose.position, processedPose.rotation)
+            showToast("Localization successful!")
+        } else {
+            binding.localizationStatus.text = "Localization failed"
+            showToast("Pose not found")
+        }
+    }
+
+    private fun onSceneUpdate(frameTime: FrameTime) {
+        val frame = arFragment.arSceneView.arFrame ?: return
+        if (frame.camera.trackingState != TrackingState.TRACKING) return
+
+        when (frame.camera.trackingState) {
+            TrackingState.TRACKING -> {
+                viewModel.updateTrackingState("Tracking Normal")
+                binding.localizeButton.isEnabled = true
+            }
+            TrackingState.PAUSED -> {
+                viewModel.updateTrackingState("Tracking Paused")
+                binding.localizeButton.isEnabled = false
+            }
+            TrackingState.STOPPED -> {
+                viewModel.updateTrackingState("Tracking Stopped")
+                binding.localizeButton.isEnabled = false
+            }
         }
     }
 
     private fun resetWorldOrigin() {
         val session = arFragment.arSceneView.session ?: return
         session.pause()
-
         val config = Config(session)
         session.configure(config)
         session.resume()
 
-        gizmoNode?.let {
-            it.localPosition = Vector3.zero()
-            it.localRotation = Quaternion.identity()
-        }
-
+        gizmoNode?.localPosition = Vector3.zero()
+        gizmoNode?.localRotation = Quaternion.identity()
         showToast("World origin reset")
     }
 
-    private fun showToast(message: String) {
-        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
-    }
-
-    data class CameraPose(
-        val position: Vector3,
-        val rotation: Quaternion
-    )
+    /** ---------------- Matrix math & pose handler ---------------- **/
+    data class CameraPose(val position: Vector3, val rotation: Quaternion)
 
     data class LocalizationResult(
         val response: LocalizationResponse,
@@ -373,17 +377,14 @@ class ARActivity : AppCompatActivity() {
         val resultPose: ResultPose
     )
 
-    data class ResultPose(
-        val position: Vector3,
-        val rotation: Quaternion
-    )
+    data class ResultPose(val position: Vector3, val rotation: Quaternion)
 
-    // Add this new method that mirrors your Swift poseHandler
+    // Mirror of the Swift-style poseHandler: uses util helpers (assumed present in your util package)
     private fun poseHandler(
         localizationResponse: LocalizationResponse,
         cameraPose: CameraPose
     ): ResultPose {
-        // Parse the response data for position and rotation
+        // Parse response rotation/position
         val resPosition = Vector3(
             localizationResponse.position.x,
             localizationResponse.position.y,
@@ -397,36 +398,35 @@ class ARActivity : AppCompatActivity() {
             localizationResponse.rotation.w
         )
 
-        // Create rotation matrix from quaternion
-        val rotationMatrix = createMatrixFromQuaternion(resRotation)
+        // Use your util functions (assumed available in project)
+        val rotationMatrix = com.multiset.sdk.android.utils.Util.createMatrixFromQuaternion(resRotation)
+        val negatedResponseMatrix = com.multiset.sdk.android.utils.Util.createTransformMatrix(rotationMatrix, resPosition)
+        val invNegatedResponseMatrix = com.multiset.sdk.android.utils.Util.invertMatrix(negatedResponseMatrix)
 
-        // Create negated response matrix (translation included)
-        val negatedResponseMatrix = createTransformMatrix(rotationMatrix, resPosition)
-
-        // Invert the negated response matrix
-        val invNegatedResponseMatrix = invertMatrix(negatedResponseMatrix)
-
-        // Create the tracker space matrix (from camera position and rotation)
-        val trackerSpaceMatrix = createTransformMatrix(
-            createMatrixFromQuaternion(cameraPose.rotation),
+        val trackerSpaceMatrix = com.multiset.sdk.android.utils.Util.createTransformMatrix(
+            com.multiset.sdk.android.utils.Util.createMatrixFromQuaternion(cameraPose.rotation),
             cameraPose.position
         )
 
-        // Calculate the resultant matrix
-        val resultantMatrix = multiplyMatrices(trackerSpaceMatrix, invNegatedResponseMatrix)
-
-        // Decompose the resultant matrix into position and rotation
-        val resultPosition = extractPosition(resultantMatrix)
-        val resultRotationRaw = extractRotation(resultantMatrix)
+        val resultantMatrix = com.multiset.sdk.android.utils.Util.multiplyMatrices(trackerSpaceMatrix, invNegatedResponseMatrix)
+        val resultPosition = com.multiset.sdk.android.utils.Util.extractPosition(resultantMatrix)
+        val resultRotationRaw = com.multiset.sdk.android.utils.Util.extractRotation(resultantMatrix)
 
         return ResultPose(resultPosition, resultRotationRaw)
     }
 
-
-    // Helper method to check device orientation
-    private fun isLandscapeOrientation(): Boolean {
-        return resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+    /** ---------------- Utility ---------------- **/
+    private fun showToast(message: String) {
+        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
     }
 
-
+    private fun getCurrentCameraPoseFromIMU(): CameraPose {
+        val frame = arFragment.arSceneView.arFrame
+        return if (frame != null) {
+            val pose = frame.camera.pose
+            CameraPose(Vector3(pose.tx(), pose.ty(), pose.tz()), Quaternion(pose.qx(), pose.qy(), pose.qz(), pose.qw()))
+        } else {
+            CameraPose(Vector3.zero(), Quaternion.identity())
+        }
+    }
 }
